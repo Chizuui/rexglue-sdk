@@ -88,6 +88,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // ROV - all written color targets use the 1 * source + 0 * destination
+      // blend equation, so the blending implementation can be omitted.
+      uint32_t rov_no_blend : 1;
     } pixel;
     uint64_t value = 0;
 

@@ -218,6 +218,8 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
+  // Guest-visible name, independent of the name used for profile storage.
+  std::string display_name() const;
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 

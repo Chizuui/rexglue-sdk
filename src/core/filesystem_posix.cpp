@@ -35,6 +35,10 @@
 #include <libgen.h>
 #include <pwd.h>
 
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#endif
+
 // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
 // explicit *64 forms for legacy 32-bit off_t distributions.
 #if defined(__APPLE__)
@@ -91,6 +95,16 @@ std::filesystem::path GetExecutablePath() {
   std::error_code ec;
   std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
   return ec ? std::filesystem::path(executable_path) : canonical_path;
+#elif defined(__ANDROID__)
+  // On Android there is no game executable: the app is a .so loaded by the
+  // Activity, and /proc/self/exe is app_process, not the game. Resolve the
+  // path of this library instead; its folder is the APK's native lib dir,
+  // where the GPU plugin .so is staged.
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&GetExecutablePath), &info) && info.dli_fname) {
+    return std::filesystem::path(info.dli_fname);
+  }
+  return {};
 #else
   char buff[FILENAME_MAX] = "";
   readlink("/proc/self/exe", buff, FILENAME_MAX);

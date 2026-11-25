@@ -158,6 +158,16 @@ class WindowedApp {
     return it != creators_->end() ? it->second : nullptr;
   }
 
+  // Single-app convenience for hosts (e.g. the SDL entry point) that link
+  // exactly one app into the binary: returns its creator, or nullptr when
+  // the registry does not hold exactly one app.
+  static Creator GetSoleCreator() {
+    if (!creators_ || creators_->size() != 1) {
+      return nullptr;
+    }
+    return creators_->begin()->second;
+  }
+
  private:
   static std::unordered_map<std::string, Creator>* creators_;
 #endif  // XE_UI_WINDOWED_APPS_IN_LIBRARY

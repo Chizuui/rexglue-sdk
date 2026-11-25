@@ -13,6 +13,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <chrono>
+#include <fstream>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -395,6 +397,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     std::lock_guard<std::mutex> lock(creation_request_lock_);
     startup_loading_ = false;
   }
+
+  InitializeDriverCache(cache_root);
 
   auto shader_storage_root = cache_root / "shaders";
   auto shader_storage_shareable_root = shader_storage_root / "shareable";
@@ -817,6 +821,7 @@ void VulkanPipelineCache::Shutdown() {
   creation_completion_event_.reset();
 
   ShutdownShaderStorage();
+  SaveAndDestroyDriverCaches();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -987,6 +992,17 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_point = 0;
   }
 
+  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
+    uint32_t written_targets = shader.writes_color_targets();
+    modification.pixel.rov_no_blend = uint32_t(written_targets != 0);
+    for (uint32_t i = 0; i < 4 && modification.pixel.rov_no_blend; ++i) {
+      if ((written_targets & (1u << i)) &&
+          (regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF) != 0x00010001) {
+        modification.pixel.rov_no_blend = 0;
+      }
+    }
+  }
+
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -1128,6 +1144,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (found_pipeline == VK_NULL_HANDLE &&
+        it->second.is_placeholder.load(std::memory_order_acquire)) {
+      // Still being created by a creation thread: the draw is skipped (see
+      // the placeholder check in the command processor) rather than waiting.
+      last_pipeline_ = &*it;
+      pipeline_out = VK_NULL_HANDLE;
+      pipeline_layout_out = nullptr;
+      if (pipeline_handle_out) {
+        *pipeline_handle_out = &it->second;
+      }
+      return true;
+    }
     if (found_pipeline == VK_NULL_HANDLE) {
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
@@ -1158,22 +1186,20 @@ bool VulkanPipelineCache::ConfigurePipeline(
 
   bool queued_async_creation = false;
   if (use_async) {
+    // Draws with a pipeline still being created are skipped by the command
+    // processor, so a placeholder pipeline (the real vertex shader with a
+    // stand-in pixel shader) would never be drawn with; creating one here
+    // compiled a vertex shader on the GPU command thread and stalled the game
+    // for up to a quarter of a second whenever new shaders appeared. Only
+    // queue the real pipeline.
     creation_arguments_real.priority = async_priority;
-    PipelineCreationArguments creation_arguments_placeholder;
-    if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
-                                                      creation_arguments_placeholder, true)) {
-      pipeline.second.is_placeholder.store(true, std::memory_order_release);
-      if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
-        {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
-          creation_queue_.push(creation_arguments_real);
-        }
-        creation_request_cond_.notify_one();
-        queued_async_creation = true;
-      } else {
-        pipeline.second.is_placeholder.store(false, std::memory_order_release);
-      }
+    pipeline.second.is_placeholder.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments_real);
     }
+    creation_request_cond_.notify_one();
+    queued_async_creation = true;
   }
 
   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
@@ -1202,7 +1228,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
   if (pipeline_handle_out) {
     *pipeline_handle_out = &pipeline.second;
   }
-  return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+  return queued_async_creation ||
+         (pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr);
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() const {
@@ -3214,6 +3241,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       return false;
   }
   input_assembly_state.primitiveRestartEnable = description.primitive_restart ? VK_TRUE : VK_FALSE;
+#if defined(__APPLE__)
+  // Metal cannot disable primitive restart for strip topologies; MoltenVK fails
+  // pipeline creation (VK_ERROR_FEATURE_NOT_PRESENT) when it is off, which
+  // drops every draw using that pipeline. A strip that does not use restart
+  // has no all-ones indices, so leaving restart on is harmless for it.
+  if (input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
+      input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+    input_assembly_state.primitiveRestartEnable = VK_TRUE;
+  }
+#endif
 
   VkPipelineViewportStateCreateInfo viewport_state;
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -3480,7 +3517,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, GetThreadDriverCache(), 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
@@ -3517,6 +3554,114 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   return true;
 }
 
+void VulkanPipelineCache::InitializeDriverCache(const std::filesystem::path& cache_root) {
+  std::lock_guard<std::mutex> lock(driver_cache_mutex_);
+  if (!driver_cache_path_.empty()) return;
+  const auto* gpu = command_processor_.GetVulkanDevice();
+  VkPhysicalDeviceProperties properties;
+  gpu->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(gpu->physical_device(),
+                                                                   &properties);
+  std::string uuid;
+  for (uint8_t byte : properties.pipelineCacheUUID) uuid += fmt::format("{:02x}", byte);
+  std::error_code error;
+  auto directory = cache_root / "shaders" / "local";
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    REXGPU_WARN("Cannot create Vulkan driver cache directory: {}", error.message());
+    return;
+  }
+  driver_cache_path_ = directory / fmt::format("{:08x}-{:08x}-{:08x}-{}.vkcache",
+      properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+  std::ifstream input(driver_cache_path_, std::ios::binary | std::ios::ate);
+  if (!input) return;
+  const auto size = input.tellg();
+  constexpr std::streamoff kMaxCacheBytes = 128 * 1024 * 1024;
+  if (size < std::streamoff(sizeof(VkPipelineCacheHeaderVersionOne)) || size > kMaxCacheBytes) return;
+  driver_cache_initial_data_.resize(size_t(size));
+  input.seekg(0);
+  if (!input.read(reinterpret_cast<char*>(driver_cache_initial_data_.data()), size)) {
+    driver_cache_initial_data_.clear();
+    return;
+  }
+  VkPipelineCacheHeaderVersionOne header;
+  std::memcpy(&header, driver_cache_initial_data_.data(), sizeof(header));
+  if (header.headerSize < sizeof(header) || header.headerSize > driver_cache_initial_data_.size() ||
+      header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+      header.vendorID != properties.vendorID || header.deviceID != properties.deviceID ||
+      std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE)) {
+    driver_cache_initial_data_.clear();
+    REXGPU_WARN("Ignoring incompatible Vulkan driver cache");
+    return;
+  }
+  REXGPU_INFO("Loaded Vulkan driver cache ({} bytes)", driver_cache_initial_data_.size());
+}
+
+VkPipelineCache VulkanPipelineCache::GetThreadDriverCache() {
+  std::lock_guard<std::mutex> lock(driver_cache_mutex_);
+  auto [entry, inserted] = driver_caches_.try_emplace(std::this_thread::get_id(), VK_NULL_HANDLE);
+  if (!inserted) return entry->second;
+  const auto* gpu = command_processor_.GetVulkanDevice();
+  VkPipelineCacheCreateInfo info = {};
+  info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  info.initialDataSize = driver_cache_initial_data_.size();
+  info.pInitialData = driver_cache_initial_data_.data();
+  VkResult result = gpu->functions().vkCreatePipelineCache(gpu->device(), &info, nullptr,
+                                                          &entry->second);
+  if (result != VK_SUCCESS && info.initialDataSize) {
+    info.initialDataSize = 0;
+    info.pInitialData = nullptr;
+    result = gpu->functions().vkCreatePipelineCache(gpu->device(), &info, nullptr, &entry->second);
+  }
+  if (result != VK_SUCCESS) {
+    entry->second = VK_NULL_HANDLE;
+    REXGPU_WARN("Vulkan driver cache unavailable ({}); compiling without it", int(result));
+  }
+  return entry->second;
+}
+
+void VulkanPipelineCache::SaveAndDestroyDriverCaches() {
+  // Called after compiler workers have joined, so no cache is being modified.
+  std::lock_guard<std::mutex> lock(driver_cache_mutex_);
+  const auto* gpu = command_processor_.GetVulkanDevice();
+  const auto& functions = gpu->functions();
+  const VkDevice device = gpu->device();
+  std::vector<VkPipelineCache> caches;
+  for (const auto& [thread, cache] : driver_caches_) {
+    if (cache != VK_NULL_HANDLE) caches.push_back(cache);
+  }
+  if (!caches.empty() && !driver_cache_path_.empty()) {
+    if (caches.size() > 1) {
+      functions.vkMergePipelineCaches(device, caches.front(), uint32_t(caches.size() - 1),
+                                      caches.data() + 1);
+    }
+    size_t size = 0;
+    if (functions.vkGetPipelineCacheData(device, caches.front(), &size, nullptr) == VK_SUCCESS &&
+        size && size <= 128 * 1024 * 1024) {
+      std::vector<uint8_t> data(size);
+      if (functions.vkGetPipelineCacheData(device, caches.front(), &size, data.data()) == VK_SUCCESS) {
+        auto temporary = driver_cache_path_;
+        temporary += "." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                     ".tmp";
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(data.data()), size);
+        output.close();
+        std::error_code error;
+        if (output) std::filesystem::rename(temporary, driver_cache_path_, error);
+        if (!output || error) {
+          REXGPU_WARN("Could not save Vulkan driver cache");
+          std::filesystem::remove(temporary, error);
+        } else {
+          REXGPU_INFO("Saved Vulkan driver cache ({} bytes)", size);
+        }
+      }
+    }
+  }
+  for (VkPipelineCache cache : caches) functions.vkDestroyPipelineCache(device, cache, nullptr);
+  driver_caches_.clear();
+  driver_cache_initial_data_.clear();
+  driver_cache_path_.clear();
+}
+
 void VulkanPipelineCache::CreationThread(size_t thread_index) {
   while (true) {
     PipelineCreationArguments creation_arguments;
@@ -3550,6 +3695,8 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        // No pipeline to wait for: let draws take the synchronous path again.
+        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       }
     }
 
@@ -3583,6 +3730,8 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        // No pipeline to wait for: let draws take the synchronous path again.
+        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       }
     }
   }

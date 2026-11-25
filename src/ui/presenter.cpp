@@ -465,7 +465,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     }
     // Try to recover from the connection becoming outdated in the previous
     // paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated ||
+        (force_paint && surface_paint_connection_state_ ==
+                            SurfacePaintConnectionState::kUnconnectedRetryAtStateChange)) {
+      // An expose can make a newly mapped surface usable without changing its
+      // pixel size. Retry on that explicit event, without polling in a paint loop.
       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
     }
     // If still paintable or recovered successfully, paint.
@@ -1361,6 +1365,8 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
     uint32_t surface_width = 0, surface_height = 0;
     bool surface_area_available = surface_->GetSize(surface_width, surface_height);
     if (!surface_area_available) {
+      REXLOG_INFO("Presenter: Surface type {} has no drawable size; waiting for resize or expose",
+                  uint32_t(surface_->GetType()));
       // The surface is currently zero-area (or has become zero-area), try again
       // when it's resized.
       DisconnectPaintingFromSurfaceFromUIThread(
@@ -1385,15 +1391,19 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
-          if (!is_reconnect) {
+          if (!is_reconnect && repaint_needed_out) {
             *repaint_needed_out = true;
           }
           break;
         case SurfacePaintConnectResult::kFailure:
+          REXLOG_WARN("Presenter: Surface type {} ({}x{}) connection failed; waiting for resize or expose",
+                      uint32_t(surface_->GetType()), surface_width, surface_height);
           surface_paint_connection_state_ =
               SurfacePaintConnectionState::kUnconnectedRetryAtStateChange;
           break;
         case SurfacePaintConnectResult::kFailureSurfaceUnusable:
+          REXLOG_ERROR("Presenter: Surface type {} ({}x{}) reported unusable",
+                       uint32_t(surface_->GetType()), surface_width, surface_height);
           surface_paint_connection_state_ =
               SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable;
           break;

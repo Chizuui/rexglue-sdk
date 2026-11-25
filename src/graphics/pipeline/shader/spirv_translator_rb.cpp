@@ -1034,6 +1034,9 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         spv::Id rt_blend_enabled =
             builder_->createBinOp(spv::OpINotEqual, type_bool_, rt_blend_factors_equations,
                                   builder_->makeUintConstant(0x00010001));
+        if (GetSpirvShaderModification().pixel.rov_no_blend) {
+          rt_blend_enabled = builder_->makeBoolConstant(false);
+        }
         SpirvBuilder::IfBuilder if_rt_blend_enabled(
             rt_blend_enabled, spv::SelectionControlDontFlattenMask, *builder_);
         {

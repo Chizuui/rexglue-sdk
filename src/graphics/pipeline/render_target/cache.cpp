@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <string>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <tuple>
@@ -42,6 +44,18 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
+
+namespace {
+template <typename Key>
+std::string DescribeRenderTargetKey(Key key) {
+  if (key.IsEmpty()) {
+    return "none";
+  }
+  return fmt::format("{}{}@{}p{}x{}", key.is_depth ? "d" : "c", uint32_t(key.resource_format),
+                     uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp),
+                     1u << uint32_t(key.msaa_samples));
+}
+}  // namespace
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
                                               uint32_t write_mask, float& clamp_rgb_low,
@@ -683,6 +697,20 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  {
+    std::string bound;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+      bound += fmt::format(" rt{}={}+{}", rt_base_index.second,
+                           DescribeRenderTargetKey(rt_keys[rt_base_index.second]),
+                           rt_lengths_tiles[i]);
+    }
+    static std::string last_bound;
+    if (bound != last_bound) {
+      last_bound = bound;
+      REXGPU_DEBUG("bind:{}", bound);
+    }
+  }
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
@@ -1237,6 +1265,7 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
   return false;
 }
 
+
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                                         uint32_t length_tiles,
                                         std::vector<Transfer>* transfers_append_out,
@@ -1336,6 +1365,11 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                       transfer_host_depth_source_rt_it != render_targets_.end()
                           ? transfer_host_depth_source_rt_it->second
                           : nullptr);
+                  REXGPU_DEBUG("transfer: {} <- {} tiles {}..{} host_depth={}",
+                               DescribeRenderTargetKey(dest),
+                               DescribeRenderTargetKey(transfer_source), it->first,
+                               transfer_end_tiles,
+                               DescribeRenderTargetKey(transfer_host_depth_source));
                 }
               }
             }

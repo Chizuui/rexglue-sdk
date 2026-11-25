@@ -21,6 +21,7 @@
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
+#include <rex/input/virtual/virtual_gamepad_driver.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 
@@ -346,6 +347,15 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
       input->AddDriver(std::move(mnk_driver));
     }
+
+#if REX_PLATFORM_ANDROID
+    // On-screen touch gamepad (overlay writes its state). Merges with a
+    // physical pad when one is connected.
+    auto vgamepad_driver = std::make_unique<vgamepad::VirtualGamepadDriver>(nullptr, 0);
+    if (vgamepad_driver->Setup() == X_STATUS_SUCCESS) {
+      input->AddDriver(std::move(vgamepad_driver));
+    }
+#endif
   }
 
   // NOP driver (primary in tool mode, fallback otherwise)

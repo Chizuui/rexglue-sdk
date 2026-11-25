@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/pacing_log.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -48,6 +50,16 @@
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
+
+#if defined(__APPLE__)
+#define REX_PRESENT_PACING_DEFAULT true
+#else
+#define REX_PRESENT_PACING_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_present_pacing, REX_PRESENT_PACING_DEFAULT, "UI/Vulkan",
+                    "Keep guest frames in step with the display: lock the guest vblank rate to "
+                    "the display's refresh and move its phase so every frame reaches the screen "
+                    "at the same point of the refresh cycle (VK_GOOGLE_display_timing feedback)");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
                     "Allow immediate present mode (no vsync)");
@@ -766,6 +778,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;
+    ResetPresentPacingForNewSwapchain();
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
@@ -866,10 +879,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         return SurfacePaintConnectResult::kFailureSurfaceUnusable;
     }
     if (vulkan_surface_create_result != VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to create a Vulkan surface");
+      REXLOG_ERROR("VulkanPresenter: Failed to create a Vulkan surface of type {}: VkResult {}",
+                   uint32_t(surface_type), int32_t(vulkan_surface_create_result));
       return SurfacePaintConnectResult::kFailure;
     }
     bool surface_unusable;
+    ResetPresentPacingForNewSwapchain();
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
@@ -1079,6 +1094,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
+    if (pacing::Enabled()) {
+      pacing::Log("f %llu %llu\n", (unsigned long long)pacing::Now(),
+                  (unsigned long long)image_instance.version);
+    }
   }
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
@@ -1149,6 +1168,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   if (!image_extent.width || !image_extent.height ||
       image_extent.width > max_framebuffer_extent.width ||
       image_extent.height > max_framebuffer_extent.height) {
+    REXLOG_WARN("VulkanPresenter: No usable swapchain extent: requested {}x{}, clamped {}x{}, framebuffer limit {}x{}",
+                width, height, image_extent.width, image_extent.height,
+                max_framebuffer_extent.width, max_framebuffer_extent.height);
     return VK_NULL_HANDLE;
   }
 
@@ -1181,6 +1203,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     }
   }
   if (queue_family_index_present == UINT32_MAX) {
+    REXLOG_WARN("VulkanPresenter: No created queue family supports presentation to this surface on '{}'",
+                vulkan_device->properties().deviceName);
     // Not unusable though - may become presentable if the window (with the same
     // surface) moved to a different display, for instance.
     return VK_NULL_HANDLE;
@@ -1528,7 +1552,77 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
+namespace {
+constexpr double kGuestFramePeriodNs = 1.0e9 / 60.0;
+
+}  // namespace
+
+// A new swapchain may be on another display, with another compositor timing:
+// calibrate again.
+void VulkanPresenter::ResetPresentPacingForNewSwapchain() {
+  present_pacing_steering_.store(false, std::memory_order_relaxed);
+  uint32_t next_present_id = present_pacing_.next_present_id;
+  present_pacing_ = PresentPacing();
+  present_pacing_.next_present_id = next_present_id;
+}
+
+// Returns whether pacing can be used for this present: the cvar is on, the
+// display timing extension is there and the display's refresh period is known.
+bool VulkanPresenter::UpdatePresentPacing(uint64_t now_ns) {
+  PresentPacing& pacing = present_pacing_;
+  if (!REXCVAR_GET(vulkan_present_pacing) ||
+      !vulkan_device_->extensions().ext_GOOGLE_display_timing) {
+    return false;
+  }
+  static PFN_vkGetRefreshCycleDurationGOOGLE get_refresh_cycle_duration =
+      reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
+          vulkan_device_->vulkan_instance()->functions().vkGetDeviceProcAddr(
+              vulkan_device_->device(), "vkGetRefreshCycleDurationGOOGLE"));
+  if (!get_refresh_cycle_duration) {
+    return false;
+  }
+  // The window may move to a display with another refresh rate.
+  if (now_ns - pacing.nominal_checked_ns > 1000000000ull) {
+    pacing.nominal_checked_ns = now_ns;
+    VkRefreshCycleDurationGOOGLE refresh_cycle = {};
+    if (get_refresh_cycle_duration(vulkan_device_->device(), paint_context_.swapchain,
+                                   &refresh_cycle) == VK_SUCCESS &&
+        refresh_cycle.refreshDuration >= 2000000 && refresh_cycle.refreshDuration <= 50000000) {
+      uint64_t nominal = refresh_cycle.refreshDuration;
+      if (!pacing.nominal_refresh_ns ||
+          std::abs(double(nominal) - double(pacing.nominal_refresh_ns)) >
+              0.02 * double(pacing.nominal_refresh_ns)) {
+        uint32_t next_present_id = pacing.next_present_id;
+        pacing = PresentPacing();
+        present_pacing_steering_.store(false, std::memory_order_relaxed);
+        pacing.next_present_id = next_present_id;
+        pacing.nominal_checked_ns = now_ns;
+        pacing.nominal_refresh_ns = nominal;
+        // The guest frame period in display refreshes (one at 60 Hz, two at
+        // 120 Hz), refined later from display timestamps.
+        pacing.refresh_ns =
+            double(nominal) * std::max(1.0, std::round(kGuestFramePeriodNs / double(nominal)));
+        present_pacing_refresh_ns_.store(uint64_t(pacing.refresh_ns), std::memory_order_relaxed);
+      }
+    }
+  }
+  return pacing.refresh_ns > 0.0;
+}
+
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  // With present pacing, a repaint without a new guest frame would replace
+  // the newest guest frame while it waits for its refresh. While guest frames
+  // keep coming, the UI is drawn with them; repaints alone go through only
+  // when they've stopped (loading, pause).
+  const uint64_t pacing_now_ns = pacing::Now();
+  const bool pacing_active = UpdatePresentPacing(pacing_now_ns);
+  if (pacing_active && !IsNewGuestOutputReady() &&
+      pacing_now_ns - present_pacing_.last_new_frame_ns < 100000000ull) {
+    return PaintResult::kNotPresented;
+  }
+  static std::atomic<uint64_t> paint_sequence{0};
+  const uint64_t current_paint_sequence =
+      paint_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
@@ -1631,13 +1725,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
+  uint32_t guest_output_mailbox_index = UINT32_MAX;
+  uint64_t guest_output_version = UINT64_MAX;
   {
-    uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
     if (guest_output_mailbox_index != UINT32_MAX) {
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+      guest_output_version = guest_output_images_[guest_output_mailbox_index].version;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
@@ -2236,11 +2332,177 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pSwapchains = &paint_context_.swapchain;
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
+  VkPresentTimesInfoGOOGLE present_times_info = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+  VkPresentTimeGOOGLE present_time = {};
+  PresentPacing& pacing = present_pacing_;
+  const bool new_guest_frame =
+      guest_output_version != UINT64_MAX && guest_output_version != pacing.last_version;
+  if (new_guest_frame) {
+    pacing.last_version = guest_output_version;
+  }
+  if (vulkan_device_->extensions().ext_GOOGLE_display_timing &&
+      (REXCVAR_GET(vulkan_present_pacing) || pacing::Enabled())) {
+    const uint64_t now_ns = pacing::Now();
+    if (new_guest_frame) {
+      present_time.presentID = ++pacing.next_present_id;
+      if (!present_time.presentID) {
+        present_time.presentID = ++pacing.next_present_id;
+      }
+    }
+    if (new_guest_frame) {
+      pacing.last_new_frame_ns = now_ns;
+      pacing.presented_at_by_id[present_time.presentID % pacing.presented_at_by_id.size()] = now_ns;
+    }
+    if (present_time.presentID || present_time.desiredPresentTime) {
+      present_times_info.swapchainCount = 1;
+      present_times_info.pTimes = &present_time;
+      present_info.pNext = &present_times_info;
+    }
+    if (new_guest_frame && pacing::Enabled()) {
+      pacing::Log("p %llu %u %llu %llu\n", (unsigned long long)now_ns, present_time.presentID,
+                  (unsigned long long)guest_output_version,
+                  (unsigned long long)present_time.desiredPresentTime);
+    }
+  }
   VkResult present_result;
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+  }
+  // When earlier frames reached the display: the refresh grid and period to
+  // place targets on, and whether targets are being met.
+  if (vulkan_device_->extensions().ext_GOOGLE_display_timing &&
+      (REXCVAR_GET(vulkan_present_pacing) || pacing::Enabled())) {
+    static PFN_vkGetPastPresentationTimingGOOGLE get_past_timing =
+        reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
+            vulkan_device_->vulkan_instance()->functions().vkGetDeviceProcAddr(
+                device, "vkGetPastPresentationTimingGOOGLE"));
+    if (get_past_timing) {
+      VkPastPresentationTimingGOOGLE timings[16];
+      uint32_t timing_count = uint32_t(rex::countof(timings));
+      if (get_past_timing(device, paint_context_.swapchain, &timing_count, timings) >= 0) {
+        for (uint32_t i = 0; i < timing_count; ++i) {
+          const VkPastPresentationTimingGOOGLE& timing = timings[i];
+          if (pacing::Enabled()) {
+            pacing::Log("d %u %llu %llu %llu\n", timing.presentID,
+                        (unsigned long long)timing.actualPresentTime,
+                        (unsigned long long)timing.earliestPresentTime,
+                        (unsigned long long)timing.presentMargin);
+          }
+          // Present ID 0 is a repaint of a frame already given an ID.
+          if (!timing.presentID || !timing.actualPresentTime || !pacing.nominal_refresh_ns) {
+            continue;
+          }
+          const uint64_t actual = timing.actualPresentTime;
+          const uint64_t presented_at =
+              pacing.presented_at_by_id[timing.presentID % pacing.presented_at_by_id.size()];
+          if (!presented_at || actual < presented_at + 2000000) {
+            // Never displayed (the window wasn't visible yet, or a newer frame
+            // replaced it): MoltenVK reports the time it was released.
+            continue;
+          }
+          if (pacing.last_shown_ns && timing.presentID > pacing.last_shown_id &&
+              actual > pacing.last_shown_ns) {
+            double delta = double(actual - pacing.last_shown_ns);
+            double refreshes = std::round(delta / pacing.refresh_ns);
+            if (refreshes >= 1.0 && refreshes <= 8.0) {
+              double sample = delta / refreshes;
+              if (std::abs(sample - pacing.refresh_ns) < 0.01 * pacing.refresh_ns) {
+                pacing.refresh_ns += (sample - pacing.refresh_ns) * 0.02;
+                present_pacing_refresh_ns_.store(uint64_t(pacing.refresh_ns),
+                                                 std::memory_order_relaxed);
+              }
+            }
+          }
+          pacing.last_shown_ns = actual;
+          pacing.last_shown_id = timing.presentID;
+          if (!pacing_active) {
+            continue;
+          }
+          // How long this frame waited from its present to the screen. With
+          // presents not synchronized to the display, the compositor takes
+          // the newest image at a fixed point of each refresh: a frame
+          // presented just before that point waits least, one just after
+          // waits a whole refresh more. When frames are presented close to
+          // that point, timing noise puts some on either side, and those are
+          // shown for two refreshes or skipped. Keep presents in the middle
+          // of the cycle, as far from that point as possible, by moving the
+          // guest vblank (and so when frames are made).
+          const double wait = double(actual - presented_at);
+          const double display_refresh = double(pacing.nominal_refresh_ns);
+          if (!pacing.calibrated) {
+            // Calibrate: slide the guest vblank later through a little more
+            // than one refresh, so frames are presented at every point of
+            // the cycle, and take the range of waits that gives.
+            pacing.wait_history[pacing.wait_history_count++] = wait;
+            present_pacing_shift_ns_.fetch_add(int64_t(display_refresh / 100.0),
+                                               std::memory_order_relaxed);
+            if (pacing.wait_history_count == pacing.wait_history.size()) {
+              std::array<double, 160> sorted = pacing.wait_history;
+              std::sort(sorted.begin(), sorted.end());
+              double low = sorted[sorted.size() * 3 / 100];
+              double high = sorted[sorted.size() * 97 / 100];
+              pacing.wait_history_count = 0;
+              const char* outcome = "again";
+              if (high - low > display_refresh * 0.6 && high - low < display_refresh * 1.4) {
+                pacing.calibrated = true;
+                pacing.steering = true;
+                present_pacing_steering_.store(true, std::memory_order_relaxed);
+                pacing.wait_middle_ns = (low + high) / 2;
+                outcome = "ok";
+              } else if (high - low < display_refresh * 0.5) {
+                // Waits barely change wherever in the cycle frames come: the
+                // display isn't taking images at fixed points, so there's
+                // nothing to keep away from.
+                pacing.calibrated = true;
+                pacing.steering = false;
+                present_pacing_steering_.store(false, std::memory_order_relaxed);
+                outcome = "flat";
+              }
+              pacing.frames_since_calibration = 0;
+              pacing.drift_ns = 0.0;
+              pacing.drift_frames = 0;
+              if (pacing::Enabled()) {
+                pacing::Log("c %llu low %.0f high %.0f %s\n", (unsigned long long)pacing::Now(),
+                            low, high, outcome);
+              }
+            }
+            continue;
+          }
+          if (!pacing.steering) {
+            if (++pacing.frames_since_calibration >= 1800) {
+              pacing.calibrated = false;
+            }
+            continue;
+          }
+          // Waiting longer than the middle: presented earlier in the cycle
+          // than needed, so make frames a little later, and the other way
+          // round.
+          double error = std::clamp(wait - pacing.wait_middle_ns, -display_refresh / 2,
+                                    display_refresh / 2);
+          double shift = error * 0.1;
+          present_pacing_shift_ns_.fetch_add(int64_t(shift), std::memory_order_relaxed);
+          pacing.drift_ns += shift;
+          if (++pacing.drift_frames >= 120) {
+            // Settled steering moves back and forth; two seconds of moving a
+            // whole refresh one way means it isn't settling, and every frame
+            // made later slows the game a little. Stop, and look again later.
+            if (std::abs(pacing.drift_ns) > display_refresh) {
+              pacing.steering = false;
+              present_pacing_steering_.store(false, std::memory_order_relaxed);
+              pacing.frames_since_calibration = 0;
+              if (pacing::Enabled()) {
+                pacing::Log("c %llu drifting %.0f flat\n", (unsigned long long)pacing::Now(),
+                            pacing.drift_ns);
+              }
+            }
+            pacing.drift_ns = 0.0;
+            pacing.drift_frames = 0;
+          }
+        }
+      }
+    }
   }
   switch (present_result) {
     case VK_SUCCESS:
@@ -2589,6 +2851,9 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
   VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
   input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
   input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+  // This pass draws four non-indexed vertices, so restart cannot affect its
+  // geometry. Metal requires restart to be enabled for strip topologies.
+  input_assembly_state.primitiveRestartEnable = VK_TRUE;
 
   VkPipelineViewportStateCreateInfo viewport_state = {};
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;

@@ -417,6 +417,11 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
+      if (fault_guest_virtual_address == 0x10) {
+        REXLOG_ERROR("T6 fault probe guest=0x{:08X} pc=0x{:016X} host=0x{:016X} op={}",
+                     fault_guest_virtual_address, ex->pc(),
+                     static_cast<uint64_t>(ex->fault_address()), is_write ? "write" : "read");
+      }
       return access_violation_callback_(std::move(lock), access_violation_callback_context_,
                                         fault_host_address, is_write);
     }

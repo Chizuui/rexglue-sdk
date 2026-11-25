@@ -3493,6 +3493,17 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
     index = builder_->createBinOp(spv::OpIAdd, type_int_, index,
                                   builder_->makeIntConstant(int(storage_index)));
   }
+  // A relative index can point outside the register file or the float
+  // constants (the Xbox 360 tolerates that). GPUs without hardware bounds
+  // checking (AMD through Metal: MoltenVK's robustBufferAccess is not real
+  // there) then read or overwrite other memory, and Tekken 6's main menu hung
+  // the GPU. Clamp to the array.
+  uint32_t array_size = is_float_constant ? constant_register_map.float_count : register_count();
+  if (array_size) {
+    index = builder_->createTriBuiltinCall(type_int_, ext_inst_glsl_std_450_, GLSLstd450SClamp,
+                                           index, const_int_0_,
+                                           builder_->makeIntConstant(int(array_size - 1)));
+  }
   return index;
 }
 

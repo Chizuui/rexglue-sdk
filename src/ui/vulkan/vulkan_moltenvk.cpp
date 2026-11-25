@@ -207,6 +207,14 @@ void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
       setenv("VK_ICD_FILENAMES", moltenvk_icd.c_str(), 1);
     }
   }
+
+#if defined(__x86_64__)
+  // Intel Macs have AMD or Intel GPUs. With Metal argument buffers an AMD
+  // Radeon Pro 580 hits a GPU timeout as soon as Tekken 6 draws a textured
+  // character; binding resources directly works. Must be set before MoltenVK
+  // loads; an explicit setting still wins.
+  setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
+#endif
 }
 
 }  // namespace rex::ui::vulkan

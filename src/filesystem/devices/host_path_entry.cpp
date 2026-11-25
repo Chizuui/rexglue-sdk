@@ -51,13 +51,19 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
 }
 
 X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
-  if (is_read_only() &&
+  auto* host_device = static_cast<HostPathDevice*>(device_);
+  const bool virtual_root_sector = !parent_ && host_device->root_sector_probe_enabled();
+  if (is_read_only() && !virtual_root_sector &&
       (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
     REXFS_ERROR("Attempting to open file for write access on read-only device");
     return X_STATUS_ACCESS_DENIED;
   }
+  if (virtual_root_sector) {
+    *out_file = new HostPathFile(desired_access, this, nullptr, true);
+    return X_STATUS_SUCCESS;
+  }
   auto file_handle = rex::filesystem::FileHandle::OpenExisting(
-      host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+      host_path_, desired_access, host_device->allow_share_delete());
   if (!file_handle) {
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;

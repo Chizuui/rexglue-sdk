@@ -32,11 +32,11 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
-  if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+  if (ImGui::Begin("Frame rate##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
-        ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+        ImGui::Text("FPS: %.1f  Frame: %.2f ms", stats.fps, stats.frame_time_ms);
       }
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS

@@ -130,6 +130,19 @@ class VulkanPresenter final : public Presenter {
 
   bool CaptureGuestOutput(RawImage& image_out) override;
 
+  // Only while steering: there the display takes images at a fixed rate. On a
+  // display that shows frames as they come, the measured period is just the
+  // guest's own frame rate coming back, and following it would let the guest
+  // drift slower or faster.
+  uint64_t GetHostRefreshPeriodNs() const override {
+    return present_pacing_steering_.load(std::memory_order_relaxed)
+               ? present_pacing_refresh_ns_.load(std::memory_order_relaxed)
+               : 0;
+  }
+  int64_t TakeGuestVblankShiftNs() override {
+    return present_pacing_shift_ns_.exchange(0, std::memory_order_relaxed);
+  }
+
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
   }
@@ -480,6 +493,42 @@ class VulkanPresenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // Present pacing (vulkan_present_pacing): when guest frames reach the screen,
+  // from VK_GOOGLE_display_timing, steers the guest vblank timer's rate and
+  // phase (GetHostRefreshPeriodNs, TakeGuestVblankShiftNs). Painting only.
+  struct PresentPacing {
+    uint64_t nominal_refresh_ns = 0;  // vkGetRefreshCycleDurationGOOGLE
+    uint64_t nominal_checked_ns = 0;
+    double refresh_ns = 0.0;          // guest frame period in refreshes, refined
+    uint64_t last_version = UINT64_MAX;
+    uint64_t last_new_frame_ns = 0;   // when the newest guest frame was presented
+    uint32_t next_present_id = 0;
+    uint32_t last_shown_id = 0;
+    uint64_t last_shown_ns = 0;
+    std::array<uint64_t, 64> presented_at_by_id = {};
+    // Present-to-screen waits seen while calibrating, and the middle of their
+    // range once calibrated.
+    std::array<double, 160> wait_history = {};
+    size_t wait_history_count = 0;
+    bool calibrated = false;
+    // No sawtooth found (the display shows frames as they come): don't steer,
+    // and calibrate again after a while.
+    bool steering = false;
+    uint32_t frames_since_calibration = 0;
+    // Steering requested over the last stretch of frames: if it keeps going
+    // one way without the waits settling, the display doesn't take images at
+    // fixed points after all (ProMotion can show frames as they come).
+    double drift_ns = 0.0;
+    uint32_t drift_frames = 0;
+    double wait_middle_ns = 0.0;
+  };
+  PresentPacing present_pacing_;
+  std::atomic<uint64_t> present_pacing_refresh_ns_{0};
+  std::atomic<int64_t> present_pacing_shift_ns_{0};
+  std::atomic<bool> present_pacing_steering_{false};
+  bool UpdatePresentPacing(uint64_t now_ns);
+  void ResetPresentPacingForNewSwapchain();
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

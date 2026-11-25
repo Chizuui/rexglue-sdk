@@ -35,6 +35,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -136,7 +138,10 @@ WindowSDL::~WindowSDL() {
 bool WindowSDL::OpenImpl() {
   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
   // uses logical points and applies the backing scale itself.
-  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
+  if (REXCVAR_GET(window_high_pixel_density)) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
 #if REX_PLATFORM_MAC
   int initial_width = int(GetDesiredLogicalWidth());
   int initial_height = int(GetDesiredLogicalHeight());
@@ -174,6 +179,13 @@ bool WindowSDL::OpenImpl() {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
     SDL_SetWindowFullscreen(sdl_window_, true);
   }
+#if defined(_WIN32)
+  else {
+    // Explicitly retain the native title bar and resize frame for windowed
+    // Windows launches.
+    SDL_SetWindowBordered(sdl_window_, true);
+  }
+#endif
 #if REX_PLATFORM_MAC
   CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse,
                            kCFPreferencesCurrentApplication);
@@ -231,6 +243,7 @@ void WindowSDL::DestroySDLWindow() {
 void* WindowSDL::GetNativeWindowHandle() const {
 #if REX_PLATFORM_WIN32
   if (!sdl_window_) {
+    REXLOG_ERROR("WindowSDL: Cannot create a presentation surface without an SDL window");
     return nullptr;
   }
   return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
@@ -398,6 +411,16 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       SDL_Metal_DestroyView(metal_view);
     }
   }
+#elif REX_PLATFORM_ANDROID
+  SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
+    auto* native_window = static_cast<ANativeWindow*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+    if (native_window) {
+      REXLOG_INFO("WindowSDL: Creating Android native window presentation surface");
+      return std::make_unique<AndroidNativeWindowSurface>(native_window, sdl_window_);
+    }
+  }
 #else
   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
@@ -406,6 +429,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     auto* wl_surface_ptr = static_cast<struct wl_surface*>(
         SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
     if (wl_display_ptr && wl_surface_ptr) {
+      REXLOG_INFO("WindowSDL: Creating Wayland presentation surface");
       return std::make_unique<WaylandSurface>(wl_display_ptr, wl_surface_ptr, sdl_window_);
     }
   }
@@ -415,10 +439,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     auto x11_window = static_cast<xcb_window_t>(
         SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
     if (display && x11_window) {
+      REXLOG_INFO("WindowSDL: Creating X11/XCB presentation surface");
       return std::make_unique<XcbWindowSurface>(XGetXCBConnection(display), x11_window);
     }
   }
 #endif
+  REXLOG_ERROR("WindowSDL: No native presentation surface for SDL driver '{}' (allowed types {:#x}): {}",
+               SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "unknown",
+               allowed_types, SDL_GetError());
   return nullptr;
 }
 
@@ -479,7 +507,12 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
     case SDL_EVENT_WINDOW_FOCUS_LOST:
       OnFocusUpdate(false, destruction_receiver);
       break;
+    case SDL_EVENT_WINDOW_SHOWN:
     case SDL_EVENT_WINDOW_EXPOSED:
+      // Native handles may become available only after the window is shown.
+      if (!HasSurface()) {
+        OnSurfaceChanged(true);
+      }
       // The platform cannot retain the previous image; force the paint.
       OnPaint(true);
       break;

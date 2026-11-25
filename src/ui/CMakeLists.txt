@@ -29,6 +29,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp
+    overlay/virtual_gamepad_overlay.cpp
 )
 
 # Vulkan UI backend
@@ -71,6 +72,10 @@ if(WIN32)
 elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_mac.cpp
+    )
+elseif(ANDROID)
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
     )
 else()
     set(REXUI_PLATFORM_SOURCES
@@ -146,7 +151,9 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 # Platform-specific dependencies
-if(UNIX AND NOT APPLE)
+# (Not Android: its Vulkan presenter uses ANativeWindow, not XCB/Wayland, and
+# the desktop libs do not exist in the NDK sysroot.)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every

@@ -234,7 +234,15 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // shaders, and the usage of fragment shader interlock, prefer the former
     // for simplicity.
     if (!fsi_path_supported) {
-      path_ = Path::kHostRenderTargets;
+      REXGPU_ERROR(
+          "Vulkan FSI was requested but is unsupported on '{}': sample_interlock={} "
+          "pixel_interlock={} fragment_atomics={} sample_shading={} standard_samples={} "
+          "storage_buffers={} required={}. Select a compatible GPU/driver.",
+          device_properties.deviceName, device_properties.fragmentShaderSampleInterlock,
+          device_properties.fragmentShaderPixelInterlock, device_properties.fragmentStoresAndAtomics,
+          device_properties.sampleRateShading, device_properties.standardSampleLocations,
+          device_properties.maxPerStageDescriptorStorageBuffers, shared_memory_binding_count + 1);
+      return false;
     }
   }
 
@@ -965,6 +973,9 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
               sizeof(last_update_framebuffer_attachments_));
   last_update_framebuffer_ = VK_NULL_HANDLE;
 
+  REXGPU_INFO("Vulkan render target path: {} on '{}'",
+              path_ == Path::kPixelShaderInterlock ? "FSI" : "host framebuffers",
+              device_properties.deviceName);
   InitializeCommon();
   return true;
 }
@@ -1143,6 +1154,23 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
+  }
+
+  {
+    const draw_util::ResolveEdramInfo& edram_info = resolve_info.IsCopyingDepth()
+                                                        ? resolve_info.depth_edram_info
+                                                        : resolve_info.color_edram_info;
+    REXGPU_DEBUG(
+        "resolve: {} base_tiles={} pitch_tiles={} msaa={} fmt={}{} {}x{} copy_len={:#x} -> "
+        "dest={:#x} pitch={} height={} dest_fmt={} clear_depth={} clear_color={}",
+        resolve_info.IsCopyingDepth() ? "depth" : "color", uint32_t(edram_info.base_tiles),
+        uint32_t(edram_info.pitch_tiles), 1u << uint32_t(edram_info.msaa_samples),
+        uint32_t(edram_info.format), edram_info.format_is_64bpp ? "(64bpp)" : "",
+        uint32_t(resolve_info.coordinate_info.width_div_8) << 3,
+        uint32_t(resolve_info.height_div_8) << 3, resolve_info.copy_dest_extent_length,
+        resolve_info.copy_dest_base, resolve_info.copy_dest_pitch, resolve_info.copy_dest_height,
+        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        resolve_info.IsClearingDepth(), resolve_info.IsClearingColor());
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();

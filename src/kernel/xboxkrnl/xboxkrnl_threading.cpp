@@ -473,7 +473,9 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
 }
 
 u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
-  return xeKeSetEvent(event_ptr, increment, wait);
+  auto result = xeKeSetEvent(event_ptr, increment, wait);
+  REXKRNL_TRACE("[KeSetEvent] ev={:#x} prev={}", event_ptr.guest_address(), result);
+  return result;
 }
 
 u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
@@ -487,6 +489,7 @@ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
 }
 
 u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
+  REXKRNL_TRACE("[KeResetEvent] ev={:#x}", event_ptr.guest_address());
   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
   if (!ev) {
     assert_always();
@@ -544,7 +547,9 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
-  return xeNtSetEvent(handle, previous_state_ptr);
+  auto result = xeNtSetEvent(handle, previous_state_ptr);
+  REXKRNL_TRACE("[NtSetEvent] handle={:#x} -> {:#x}", handle, result);
+  return result;
 }
 
 u32 NtPulseEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
@@ -577,6 +582,7 @@ uint32_t xeNtClearEvent(uint32_t handle) {
 }
 
 u32 NtClearEvent_entry(u32 handle) {
+  REXKRNL_TRACE("[NtClearEvent] handle={:#x}", handle);
   return xeNtClearEvent(handle);
 }
 
@@ -670,6 +676,8 @@ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previ
   if (previous_count_ptr) {
     *previous_count_ptr = (uint32_t)previous_count;
   }
+  REXKRNL_TRACE("[NtReleaseSemaphore] handle={:#x} count={} prev={} -> {:#x}", sem_handle,
+                       release_count, previous_count, result);
 
   return result;
 }
@@ -726,6 +734,7 @@ u32 NtReleaseMutant_entry(u32 mutant_handle, u32 unknown) {
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
+  REXKRNL_TRACE("[NtReleaseMutant] handle={:#x} -> {:#x}", mutant_handle, result);
 
   return result;
 }
@@ -839,14 +848,13 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
-  // timeout={}",
-  // object_ptr.guest_address(), (uint32_t)wait_reason,
-  //(uint32_t)processor_mode, (uint32_t)alertable,
-  // timeout_ptr ? (int64_t)timeout : -1);
+  REXKRNL_TRACE("[KeWaitForSingleObject] obj={:#x} alertable={} timeout={}",
+                       object_ptr.guest_address(), (uint32_t)alertable,
+                       timeout_ptr ? (int64_t)timeout : -1);
   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
                                         timeout_ptr ? &timeout : nullptr);
-  // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
+  REXKRNL_TRACE("[KeWaitForSingleObject] obj={:#x} -> {:#x}", object_ptr.guest_address(),
+                       result);
   return result;
 }
 
@@ -857,6 +865,8 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    REXKRNL_TRACE("[NtWaitForSingleObjectEx] handle={:#x} alertable={} timeout={}",
+                         object_handle, (uint32_t)alertable, timeout_ptr ? (int64_t)timeout : -1);
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
@@ -864,6 +874,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
+  REXKRNL_TRACE("[NtWaitForSingleObjectEx] handle={:#x} -> {:#x}", object_handle, result);
 
   return result;
 }
@@ -932,11 +943,15 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    REXKRNL_TRACE("[NtSignalAndWaitForSingleObjectEx] signal={:#x} wait={:#x} alertable={} timeout={}", signal_handle,
+                         wait_handle, (uint32_t)alertable, timeout_ptr ? (int64_t)timeout : -1);
     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
                                     timeout_ptr ? &timeout : nullptr);
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
+  REXKRNL_TRACE("[NtSignalAndWaitForSingleObjectEx] signal={:#x} wait={:#x} -> {:#x}",
+                       signal_handle, wait_handle, result);
 
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();

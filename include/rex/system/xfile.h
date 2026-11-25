@@ -13,6 +13,7 @@
 #include <string>
 #include <filesystem>
 #include <mutex>
+#include <vector>
 
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/entry.h>
@@ -24,6 +25,16 @@
 #include <rex/system/xtypes.h>
 
 namespace rex::system {
+
+// A guest-visible logical DATA stream segment backed by a decoded XMem-TD
+// bank.  The runtime keeps these per XFile because the same DATA*.BIN can be
+// opened more than once for unrelated logical substreams.
+struct Tekken6TdVirtualSegment {
+  uint64_t logical_start = 0;
+  uint64_t decoded_start = 0;
+  uint64_t length = 0;
+  uint32_t index_entry = 0;
+};
 
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_directory_information
 class X_FILE_DIRECTORY_INFORMATION {
@@ -136,6 +147,10 @@ class XFile : public XObject {
   mutable std::mutex file_lock_;
   std::mutex completion_port_lock_;
   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
+
+  // Populated only by the opt-in IDX-aware TD bridge.  The normal XFile path
+  // remains unchanged, and segments are never used for non-Tekken files.
+  std::vector<Tekken6TdVirtualSegment> tekken6_td_segments_;
 
   // TODO(benvanik): create flags, open state, etc.
 

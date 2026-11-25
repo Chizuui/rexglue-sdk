@@ -9,11 +9,21 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/pacing_log.h>
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
 #include <cctype>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
+#include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -30,6 +40,11 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+REXCVAR_DEFINE_INT32(guest_vblank_hz, 0, "GPU",
+                    "Override guest vblank frequency independently of GPU wait pacing; 0 uses vsync defaults")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
@@ -150,6 +165,28 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+#if defined(__APPLE__)
+        // Ordinary threads wake up milliseconds late when the CPU is busy:
+        // schedule this one as real time, like an audio thread (it does
+        // well under a millisecond of work per 16.7 ms).
+        {
+          mach_timebase_info_data_t timebase;
+          mach_timebase_info(&timebase);
+          auto ns_to_abs = [&](double ns) {
+            return uint32_t(ns * double(timebase.denom) / double(timebase.numer));
+          };
+          thread_time_constraint_policy_data_t policy;
+          policy.period = ns_to_abs(1.0e9 / 60.0);
+          policy.computation = ns_to_abs(1.0e6);
+          policy.constraint = ns_to_abs(2.0e6);
+          policy.preemptible = 1;
+          if (thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                                THREAD_TIME_CONSTRAINT_POLICY, thread_policy_t(&policy),
+                                THREAD_TIME_CONSTRAINT_POLICY_COUNT) != KERN_SUCCESS) {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+          }
+        }
+#endif
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
@@ -157,16 +194,54 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
-        while (vsync_worker_running_) {
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
-            MarkVblank();
-            last_frame_time += interval_ticks;
+        // A guest frame at the display's own refresh rate (one or two
+        // refreshes at 60 or 120 Hz) when that's within 0.6% of the guest's,
+        // so guest frames and display refreshes don't drift apart.
+        auto vblank_interval_ticks = [&]() -> uint64_t {
+          uint64_t refresh_ns = presenter_ ? presenter_->GetHostRefreshPeriodNs() : 0;
+          if (refresh_ns) {
+            double guest_ns = 1.0e9 / refresh_rate_hz;
+            double frame_ns = double(refresh_ns) * std::max(1.0, std::round(guest_ns / refresh_ns));
+            if (std::abs(frame_ns - guest_ns) < 0.006 * guest_ns) {
+              return std::max(uint64_t(1), uint64_t(frame_ns * double(guest_tick_frequency) / 1.0e9));
+            }
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          return vsync_interval_ticks;
+        };
+        uint64_t next_vblank = chrono::Clock::QueryGuestTickCount() + vsync_interval_ticks;
+        while (vsync_worker_running_) {
+          const int32_t forced_vblank_hz = REXCVAR_GET(guest_vblank_hz);
+          uint64_t interval_ticks = forced_vblank_hz > 0
+              ? std::max(uint64_t(1), guest_tick_frequency / uint64_t(forced_vblank_hz))
+              : (REXCVAR_GET(vsync) ? vblank_interval_ticks() : no_vsync_interval_ticks);
+          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          if (current_time >= next_vblank) {
+            MarkVblank();
+            next_vblank += interval_ticks;
+            // Move toward the phase where frames reach the screen evenly, at
+            // most a millisecond per frame.
+            if (REXCVAR_GET(vsync) && presenter_) {
+              int64_t shift_ns = std::clamp<int64_t>(presenter_->TakeGuestVblankShiftNs(), -1000000,
+                                                     1000000);
+              next_vblank = uint64_t(int64_t(next_vblank) +
+                                     shift_ns * int64_t(guest_tick_frequency) / 1000000000);
+            }
+            // After a stall (debugger, sleep), resume the cadence from now
+            // instead of firing the missed vblanks back to back.
+            if (current_time >= next_vblank + 4 * interval_ticks) {
+              next_vblank = current_time + interval_ticks;
+            }
+            continue;
+          }
+          // Sleep until shortly before the deadline, then yield until it: a
+          // 1 ms polling sleep put up to a millisecond of jitter on every guest
+          // frame.
+          uint64_t remaining_us = (next_vblank - current_time) * 1000000 / guest_tick_frequency;
+          if (remaining_us > 400) {
+            rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(remaining_us - 300, 20000)));
+          } else {
+            rex::thread::MaybeYield();
+          }
         }
         return 0;
       }));
@@ -201,6 +276,41 @@ void GraphicsSystem::Shutdown() {
   }
 
   provider_.reset();
+}
+
+system::GuestFrameStats GraphicsSystem::guest_frame_stats() const {
+  return {
+      guest_frame_count_snapshot_.load(std::memory_order_relaxed),
+      guest_fps_.load(std::memory_order_relaxed),
+      guest_frame_time_ms_.load(std::memory_order_relaxed),
+  };
+}
+
+void GraphicsSystem::RecordGuestFrame(uint64_t host_ticks, uint64_t host_frequency) {
+  if (!host_frequency) {
+    return;
+  }
+
+  ++guest_frame_count_;
+  guest_frame_count_snapshot_.store(guest_frame_count_, std::memory_order_relaxed);
+
+  guest_frame_window_ticks_.push_back(host_ticks);
+  while (guest_frame_window_ticks_.size() > 2 &&
+         host_ticks - guest_frame_window_ticks_.front() > host_frequency) {
+    guest_frame_window_ticks_.pop_front();
+  }
+  if (guest_frame_window_ticks_.size() >= 2) {
+    const uint64_t window_ticks =
+        guest_frame_window_ticks_.back() - guest_frame_window_ticks_.front();
+    const size_t intervals = guest_frame_window_ticks_.size() - 1;
+    if (window_ticks) {
+      guest_fps_.store(static_cast<double>(intervals) * host_frequency / window_ticks,
+                       std::memory_order_relaxed);
+      guest_frame_time_ms_.store(static_cast<double>(window_ticks) * 1000.0 /
+                                     host_frequency / intervals,
+                                 std::memory_order_relaxed);
+    }
+  }
 }
 
 void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
@@ -317,6 +427,9 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 }
 
 void GraphicsSystem::MarkVblank() {
+  if (pacing::Enabled()) {
+    pacing::Log("v %llu\n", (unsigned long long)pacing::Now());
+  }
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 

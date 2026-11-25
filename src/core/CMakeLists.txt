@@ -24,10 +24,11 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
-if(APPLE)
+if(APPLE OR ANDROID)
     # Apple's libc++ still gates std::jthread/std::stop_token behind the
-    # experimental-library feature flag. Only timer_queue.cpp uses them, and
-    # neither type crosses a header boundary.
+    # experimental-library feature flag; the NDK's libc++ does the same on
+    # Android. Only timer_queue.cpp uses them, and neither type crosses a
+    # header boundary.
     set_source_files_properties(timer_queue.cpp PROPERTIES
         COMPILE_OPTIONS "-fexperimental-library")
 endif()
@@ -101,7 +102,12 @@ target_include_directories(rexcore PRIVATE
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
 elseif(UNIX)
-    target_link_libraries(rexcore PRIVATE pthread rt dl)
+    if(ANDROID)
+        # Bionic folds pthread/rt into libc; only dl stays a separate lib.
+        target_link_libraries(rexcore PRIVATE dl)
+    else()
+        target_link_libraries(rexcore PRIVATE pthread rt dl)
+    endif()
 endif()
 
 target_link_libraries(rexcore

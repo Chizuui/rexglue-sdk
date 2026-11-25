@@ -122,6 +122,17 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(const std::filesystem::path& pa
 }
 
 #if REX_PLATFORM_ANDROID
+namespace rex::filesystem {
+// STUB (probe): opening a content:// URI needs JNI into the app's
+// ContentResolver (openFileDescriptor + detachFd), which only exists once the
+// Android app shell provides an Activity/Context. Until then this fails
+// cleanly (-1) and OpenForAndroidContentUri returns nullptr; regular file
+// paths are unaffected.
+int OpenAndroidContentFileDescriptor(const std::string_view /*uri*/, const char* /*mode*/) {
+  return -1;
+}
+}  // namespace rex::filesystem
+
 std::unique_ptr<MappedMemory> MappedMemory::OpenForAndroidContentUri(const std::string_view uri,
                                                                      Mode mode, size_t offset,
                                                                      size_t length) {

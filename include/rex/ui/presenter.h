@@ -362,6 +362,16 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+
+  // The refresh period of the display the guest output is presented on, in
+  // nanoseconds, measured from presentation timestamps; 0 if unknown. The guest
+  // vblank timer follows it so that guest frames and display refreshes don't
+  // drift apart. Callable from any thread.
+  virtual uint64_t GetHostRefreshPeriodNs() const { return 0; }
+  // How far to move the guest vblank timer (positive: later) so guest frames
+  // reach the presenter at the same point of the display's refresh cycle;
+  // returns the amount requested since the last call. Callable from any thread.
+  virtual int64_t TakeGuestVblankShiftNs() { return 0; }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
@@ -932,6 +942,15 @@ class Presenter {
   // connection as the next successful reconnection should be followed by a
   // repaint request anyway.
   std::atomic<bool> ui_thread_paint_requested_{false};
+
+ protected:
+  // Whether the guest output has been refreshed since it was last consumed.
+  bool IsNewGuestOutputReady() const {
+    uint32_t acquired_and_ready = guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
+    return (acquired_and_ready >> 2) != (acquired_and_ready & 3);
+  }
+
+ private:
 
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.

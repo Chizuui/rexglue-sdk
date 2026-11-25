@@ -371,6 +371,16 @@ class VulkanPipelineCache {
   void CreateQueuedPipelinesOnProcessorThread();
   void ProcessDeferredPipelineDestructions(bool force_all);
 
+  void InitializeDriverCache(const std::filesystem::path& cache_root);
+  VkPipelineCache GetThreadDriverCache();
+  void SaveAndDestroyDriverCaches();
+  // Each compiler thread owns a separate cache: Vulkan cache access requires
+  // external synchronization, and a shared lock would serialize compilation.
+  std::mutex driver_cache_mutex_;
+  std::unordered_map<std::thread::id, VkPipelineCache> driver_caches_;
+  std::vector<uint8_t> driver_cache_initial_data_;
+  std::filesystem::path driver_cache_path_;
+
   VulkanCommandProcessor& command_processor_;
   const RegisterFile& register_file_;
   VulkanRenderTargetCache& render_target_cache_;

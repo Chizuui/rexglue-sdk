@@ -22,6 +22,12 @@
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
+#if REX_PLATFORM_ANDROID
+// SDL's Android bootstrap (SDLActivity) dlsyms "SDL_main" in libmain.so.
+// SDL_main.h renames main() to SDL_main() on this platform.
+#include <SDL3/SDL_main.h>
+#endif
+
 #if REX_PLATFORM_WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -55,7 +61,17 @@ int RunWindowedApp(int argc, char** argv) {
     }
 #endif
 
+#if XE_UI_WINDOWED_APPS_IN_LIBRARY
+    // Android builds register the (single) app in a library registry instead
+    // of defining GetWindowedAppCreator().
+    auto creator = rex::ui::WindowedApp::GetSoleCreator();
+    if (!creator) {
+      return EXIT_FAILURE;
+    }
+    std::unique_ptr<rex::ui::WindowedApp> app = creator(app_context);
+#else
     std::unique_ptr<rex::ui::WindowedApp> app = rex::ui::GetWindowedAppCreator()(app_context);
+#endif
 
     // Match remaining positional args to the app's expected options.
     const auto& option_names = app->GetPositionalOptions();

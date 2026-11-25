@@ -11,6 +11,9 @@
  */
 
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -47,6 +50,51 @@ namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
+  // Opt-in, GPU-command-thread-only instrumentation. No extra GPU waits.
+  struct Profile {
+    FILE* file = nullptr;
+    uint64_t frame = 0, draws = 0, draw_ns = 0, upload_bytes = 0,
+             upload_ranges = 0, copies = 0, hoisted_bytes = 0, upload_ns = 0,
+             pass_ends = 0, submits = 0, fence_ns = 0, submit_ns = 0;
+    bool timestamp_checked = false, timestamp_allocation_failed = false;
+    float timestamp_period = 0;
+    uint32_t timestamp_bits = 0;
+    static uint64_t Now() {
+      return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    Profile() {
+      const char* path = std::getenv("TEKKEN6_GPU_PROFILE");
+      if (path && *path) file = std::fopen(path, "w");
+      if (file) std::fprintf(file,
+          "# F,time_ns,frame,draw_attempts,draw_cpu_ns,upload_bytes,upload_ranges,copy_commands,hoisted_bytes,upload_cpu_ns,pass_ends,submits,fence_wait_ns,queue_submit_cpu_ns\n"
+          "# G,time_ns,frame,submission,gpu_span_ns\n");
+    }
+    ~Profile() { if (file) std::fclose(file); }
+    struct Timer {
+      uint64_t& total;
+      uint64_t start;
+      Timer(uint64_t& value, bool enabled) : total(value), start(enabled ? Now() : 0) {}
+      ~Timer() { if (start) total += Now() - start; }
+    };
+    void EndFrame() {
+      if (!file) return;
+      std::fprintf(file, "F,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+          (unsigned long long)Now(), (unsigned long long)frame,
+          (unsigned long long)draws, (unsigned long long)draw_ns,
+          (unsigned long long)upload_bytes, (unsigned long long)upload_ranges,
+          (unsigned long long)copies, (unsigned long long)hoisted_bytes,
+          (unsigned long long)upload_ns, (unsigned long long)pass_ends,
+          (unsigned long long)submits, (unsigned long long)fence_ns,
+          (unsigned long long)submit_ns);
+      std::fflush(file);
+      ++frame;
+      draws = draw_ns = upload_bytes = upload_ranges = copies = hoisted_bytes =
+          upload_ns = pass_ends = submits = fence_ns = submit_ns = 0;
+    }
+  };
+  Profile& profile() { return profile_; }
+
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
@@ -268,9 +316,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueCopy() override;
 
  private:
+  Profile profile_;
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;
+    VkQueryPool profile_queries = VK_NULL_HANDLE;
+    uint64_t profile_frame = 0;
+
   };
 
   struct SparseBufferBind {
@@ -788,11 +840,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
 
+  // Resolved descriptor contents for the last draw in this frame. Compare
+  // actual views and sampler handles, so texture reloads and sampler eviction
+  // invalidate bindings even when guest fetch constants are unchanged.
+  std::vector<VkDescriptorImageInfo> texture_descriptor_contents_[2];
+  VkDescriptorSetLayout texture_descriptor_layouts_[2] = {};
+  uint32_t texture_descriptor_image_counts_[2] = {};
+
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
   // but in_render_pass_ is true.
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+  // With dynamic rendering, a transfer pass and a draw pass into the same
+  // framebuffer differ only in their attachments (the transfer binds just the
+  // destination, through an ownership transfer view whose format may be an
+  // integer one), so the framebuffer alone can't tell whether the open pass is
+  // the one needed. The transfer destination view, VK_NULL_HANDLE for a draw
+  // pass.
+  VkImageView current_transfer_dest_view_ = VK_NULL_HANDLE;
   bool in_render_pass_ = false;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with

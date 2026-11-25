@@ -51,6 +51,11 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Graphics backend used by the GPU plugin: any, d3d12, or vulkan")
+    .allowed({"any", "d3d12", "vulkan"})
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 
 // --- ReXApp ---
@@ -142,8 +147,17 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
+  // Config file: next to the executable on desktop. On Android the native
+  // lib dir is read-only, so keep it with the (writable) user data instead.
+  std::filesystem::path config_path;
+#if REX_PLATFORM_ANDROID
+  config_path = user_dir / (std::string(GetName()) + ".toml");
+#else
+  config_path = exe_dir / (std::string(GetName()) + ".toml");
+#endif
+
   PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+                         cache_dir, metadata_dir, config_path};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -168,7 +182,13 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
+#if REX_PLATFORM_ANDROID
+    // The native lib dir is read-only on Android; keep logs with the
+    // (writable) user data so Export Log can find them.
+    log_config.log_dir = (user_data_root_ / "logs").string();
+#else
     log_config.log_dir = (exe_dir / "logs").string();
+#endif
   }
 
   rex::InitLogging(log_config);
@@ -314,7 +334,7 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =
@@ -394,7 +414,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
+  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle FPS overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
     } else {
@@ -402,6 +422,25 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
   });
+#if REX_PLATFORM_ANDROID
+  // No keyboard on a phone: show the FPS overlay from launch (F3 does not
+  // exist here). It can be hidden again from the touch gamepad/settings.
+  debug_overlay_ =
+      std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+  // On-screen touch gamepad (full Xbox layout). Its menu button toggles
+  // the FPS overlay, since F3 does not exist on a phone.
+  virtual_gamepad_overlay_ = std::make_unique<ui::VirtualGamepadOverlayDialog>(
+      imgui_drawer_.get(), [this] {
+        if (debug_overlay_) {
+          debug_overlay_.reset();
+        } else {
+          debug_overlay_ =
+              std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+        }
+      });
+  window_->AddInputListener(virtual_gamepad_overlay_.get(),
+                            ui::VirtualGamepadOverlayDialog::kInputZOrder);
+#endif
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
       console_overlay_.reset();

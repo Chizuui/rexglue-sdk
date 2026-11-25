@@ -37,6 +37,11 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_INT32(guest_frame_limit, 0, "GPU",
+                    "Maximum guest frame swaps per second, independent of guest vsync (0 disables)")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -930,19 +935,38 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  // Pace actual guest swaps independently of the vblank worker. This allows
+  // titles to bypass coarse vblank waits without running faster than intended
+  // on high-refresh displays. Keep state per command processor, not global.
+  const int32_t frame_limit = REXCVAR_GET(guest_frame_limit);
+  if (frame_limit > 0) {
+    const auto interval = std::chrono::nanoseconds(1000000000LL / frame_limit);
+    auto now = std::chrono::steady_clock::now();
+    if (frame_limit != guest_frame_limit_last_ ||
+        now > next_guest_frame_ + interval) {
+      next_guest_frame_ = now;
+    }
+    if (now < next_guest_frame_) {
+      std::this_thread::sleep_until(next_guest_frame_);
+    }
+    next_guest_frame_ += interval;
+  }
+  guest_frame_limit_last_ = frame_limit;
+
   {
     static uint64_t last_frame_tick = 0;
     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
     if (last_frame_tick) {
-      uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
       int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
       PROFILE_FRAME_TIME_US(dt_us);
       PROFILE_FPS(freq / (now - last_frame_tick));
     }
     last_frame_tick = now;
+    if (graphics_system_ && freq) {
+      graphics_system_->RecordGuestFrame(now, freq);
+    }
   }
-#endif
   rex::perf::Profiler::Flip();
 
   // Xenia-specific VdSwap hook.

@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdlib>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -149,6 +151,16 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
       break;
     }
     case XFileXctdCompressionInformation: {
+      // The opt-in DATA bridge serves extracted DATA banks as decoded
+      // streams.  Tell the guest that the kernel should not transparently
+      // decompress those reads.  The default remains the strict stub.
+      if (std::getenv("TEKKEN6_XCTD_REPORT_UNCOMPRESSED") != nullptr &&
+          std::getenv("TEK6_RUNTIME_TD_IDX_BRIDGE") != nullptr) {
+        auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
+        info->unknown = 0;
+        out_length = sizeof(*info);
+        break;
+      }
       REXKRNL_ERROR(
           "NtQueryInformationFile(XFileXctdCompressionInformation) "
           "unimplemented");

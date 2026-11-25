@@ -267,6 +267,12 @@ else()
         set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
     endif()
 endif()
+if(ANDROID)
+    # Android uses SDL's Android video driver; the host X11/Wayland libs found
+    # by pkg-config do not exist in the NDK sysroot.
+    set(SDL_X11 OFF CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+endif()
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -289,8 +295,9 @@ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux video and audio backends. Both video drivers are always built so the
-# one in use stays a runtime choice.
-if(UNIX AND NOT APPLE)
+# one in use stays a runtime choice. (Not Android: it uses SDL's Android
+# video/audio drivers, and the desktop libs do not exist in the NDK sysroot.)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     set(SDL_X11               ON  CACHE BOOL "" FORCE)
     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)

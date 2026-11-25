@@ -9,8 +9,11 @@
  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
  */
 
+#include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -25,6 +28,7 @@
 #include <mach/vm_region.h>
 #endif  // REX_PLATFORM_MAC
 
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -53,8 +57,7 @@
 
 #include <linux/ashmem.h>
 
-// TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#include <rex/main_android.h>
 #endif
 
 namespace rex {
@@ -173,6 +176,44 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
 // Find the mapping entry in /proc/self/maps that contains the given address
 static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+  // Linux 6.11+ can query one VMA directly rather than formatting and parsing
+  // the entire map list inside every guest write-watch signal handler. Keep
+  // the stable UAPI layout here so builds with older distro headers benefit
+  // on new kernels too. See include/uapi/linux/fs.h, struct procmap_query.
+  struct ProcMapQuery {
+    uint64_t size, flags, address, start, end, access, page_size, offset, inode;
+    uint32_t dev_major, dev_minor, name_size, build_id_size;
+    uint64_t name_address, build_id_address;
+  };
+  static_assert(sizeof(ProcMapQuery) == 104);
+  static std::atomic<bool> direct_query_supported{true};
+  static const bool legacy_query = std::getenv("REX_LINUX_FAST_MAP_QUERY") == nullptr ||
+                                   std::getenv("REX_LINUX_LEGACY_MAP_QUERY") != nullptr;
+  if (!legacy_query && direct_query_supported.load(std::memory_order_relaxed)) {
+    // Open per query: no stale descriptor after fork, and no fd lifetime or
+    // shared file-position synchronization is required between fault handlers.
+    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+      ProcMapQuery query{};
+      query.size = sizeof(query);
+      query.address = addr;
+      const int result = ioctl(fd, _IOWR('f', 17, ProcMapQuery), &query);
+      const int error = errno;
+      close(fd);
+      if (result == 0) {
+        out_entry = LinuxMapEntry{};
+        out_entry.start = query.start;
+        out_entry.end = query.end;
+        out_entry.perms[0] = (query.access & 1) ? 'r' : '-';
+        out_entry.perms[1] = (query.access & 2) ? 'w' : '-';
+        out_entry.perms[2] = (query.access & 4) ? 'x' : '-';
+        return query.start <= addr && addr < query.end;
+      }
+      if (error == ENOENT) return false;  // Address is not mapped.
+      if (error == ENOTTY || error == EINVAL || error == ENOSYS || error == EOPNOTSUPP)
+        direct_query_supported.store(false, std::memory_order_relaxed);
+    }
+  }
   std::ifstream maps("/proc/self/maps");
   if (!maps.is_open())
     return false;

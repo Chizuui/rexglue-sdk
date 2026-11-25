@@ -34,5 +34,9 @@ if(WIN32)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()
+if(ANDROID)
+    # On-screen touch gamepad (overlay writes its state, driver reads it).
+    target_sources(rexinput PRIVATE virtual/virtual_gamepad_driver.cpp)
+endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)

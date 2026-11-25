@@ -17,6 +17,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 
+#if REX_PLATFORM_LINUX
+#include <cerrno>
+#include <pwd.h>
+#include <unistd.h>
+#endif
+
 namespace rex {
 namespace system {
 namespace xam {
@@ -91,6 +97,32 @@ UserProfile::UserProfile() {
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFE));
   // XPROFILE_TITLE_SPECIFIC3
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFD));
+}
+
+std::string UserProfile::display_name() const {
+#if REX_PLATFORM_LINUX
+  static const std::string account_name = []() -> std::string {
+    // Resolve the actual login account, rather than trusting USER/LOGNAME.
+    // Cache the lookup so guest name requests do not repeatedly call NSS.
+    std::vector<char> buffer(16384);
+    while (buffer.size() <= 1024 * 1024) {
+      struct passwd entry{};
+      struct passwd* result = nullptr;
+      const int error = getpwuid_r(getuid(), &entry, buffer.data(), buffer.size(), &result);
+      if (error == ERANGE) {
+        buffer.resize(buffer.size() * 2);
+        continue;
+      }
+      if (!error && result && result->pw_name && result->pw_name[0]) {
+        return result->pw_name;
+      }
+      break;
+    }
+    return {};
+  }();
+  if (!account_name.empty()) return account_name;
+#endif
+  return name_;
 }
 
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {

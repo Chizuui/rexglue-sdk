@@ -125,7 +125,11 @@ bool build_bctr(BuilderContext& ctx) {
   }
 
   if (jt) {
-    ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
+    if (jt->selectorMask == 0xFFFFFFFF) {
+      ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
+    } else {
+      ctx.println("\tswitch ({}.u32 & 0x{:08X}) {{", ctx.r(jt->indexRegister), jt->selectorMask);
+    }
 
     for (size_t i = 0; i < jt->targets.size(); i++) {
       ctx.println("\tcase {}:", i);
